@@ -1,3 +1,4 @@
+# breakout_scanner_v3.py
 import argparse
 import asyncio
 import time
@@ -95,6 +96,7 @@ class VectorizedQuantEngine:
         
         asset_returns = np.diff(c_h4[-21:]) / c_h4[-22:-1] if len(c_h4) >= 22 else np.zeros(20)
         alpha_score_metric = 5.0
+        beta = 1.0
         if len(asset_returns) == len(btc_returns) and len(btc_returns) > 0:
             try:
                 cov = np.cov(asset_returns, btc_returns)[0][1]
@@ -118,7 +120,6 @@ class VectorizedQuantEngine:
         
         composite_alpha_score = score_volume + score_momentum + score_coiling + score_trend + score_oi + score_funding + score_alpha
         
-        # DEBUG: Full component breakdown
         if args.debug:
             print(f"\n  ✓ {symbol} ANALYSIS:")
             print(f"    Score: {composite_alpha_score:.1f} | Vol%: {vol_percentile*100:.0f} | ATR: {atr_mult:.2f}x | OI: {oi_change_pct*100:+.1f}%")
@@ -153,7 +154,6 @@ class ProductionDataPipeline:
     def __init__(self, base_url: str):
         self.base_url = base_url
         self.semaphore = asyncio.Semaphore(args.concurrency_limit)
-        self.api_timestamp_mode = None  # Cache which format works
 
     async def retrieve_active_universe(self, session: aiohttp.ClientSession) -> List[str]:
         url = f"{self.base_url}/api/v1/contract/detail"
@@ -162,7 +162,7 @@ class ProductionDataPipeline:
                 payload = await response.json()
                 data = payload.get("data") or []
                 symbols = [str(item.get("symbol")).upper() for item in data 
-                        if str(item.get("settleCoin")).upper() == "USDT" and int(item.get("state", 0)) == 0]
+                           if str(item.get("settleCoin")).upper() == "USDT" and int(item.get("state", 0)) == 0]
                 if args.debug:
                     print(f"[UNIVERSE] Loaded {len(symbols)} active USDT perpetual pairs")
                 return symbols
@@ -171,76 +171,44 @@ class ProductionDataPipeline:
             return []
 
     async def fetch_clean_kline(self, session: aiohttp.ClientSession, symbol: str, interval: str, duration_days: int) -> Optional[dict]:
-        """
-        🔧 ADAPTIVE TIMESTAMP ENGINE
-        
-        Attempts to fetch klines with intelligent fallback:
-        1. First tries the cached working format (if known)
-        2. Falls back to seconds, then milliseconds
-        3. Caches the successful format for future requests
-        """
         url = f"{self.base_url}/api/v1/contract/kline/{symbol}"
-        now_sec = int(time.time())
+        params = {"interval": interval}
         
-        # Attempt order: cached format first, then seconds, then milliseconds
-        time_formats = []
-        if self.api_timestamp_mode:
-            time_formats.append(self.api_timestamp_mode)
-        time_formats.extend(['seconds', 'milliseconds'])
-        
-        for time_unit in time_formats:
-            if time_unit == 'seconds':
-                end_time = now_sec
-                start_time = now_sec - (duration_days * 86400)
-            else:  # milliseconds
-                end_time = now_sec * 1000
-                start_time = (now_sec - (duration_days * 86400)) * 1000
-
-            params = {"interval": interval, "start": start_time, "end": end_time}
-            
-            async with self.semaphore:
-                for attempt in range(3):
-                    try:
-                        async with session.get(url, params=params, timeout=12) as response:
-                            if response.status == 429:
-                                await asyncio.sleep(2 ** attempt)
-                                continue
-                            if response.status != 200:
-                                continue
+        async with self.semaphore:
+            for attempt in range(3):
+                try:
+                    async with session.get(url, params=params, timeout=12) as response:
+                        if response.status == 429:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        if response.status != 200: 
+                            continue
                             
-                            raw = await response.json()
-                            d = raw.get("data") or {}
+                        raw = await response.json()
+                        d = raw.get("data") or {}
+                        if not d or 'time' not in d or len(d['time']) == 0: 
+                            continue
                             
-                            if d and 'time' in d and len(d['time']) > 0:
-                                # Cache successful format
-                                if not self.api_timestamp_mode:
-                                    self.api_timestamp_mode = time_unit
-                                    if args.debug:
-                                        print(f"[API] Detected working timestamp format: {time_unit}")
-                                
-                                return {
-                                    'time': np.array(d['time'], dtype=np.int64),
-                                    'open': np.array(d['open'], dtype=np.float64),
-                                    'high': np.array(d['high'], dtype=np.float64),
-                                    'low': np.array(d['low'], dtype=np.float64),
-                                    'close': np.array(d['close'], dtype=np.float64),
-                                    'volume': np.array(d['volume'], dtype=np.float64),
-                                    'open_interest': np.array(d.get('openInterest', np.zeros_like(d['close'])), dtype=np.float64)
-                                }
-                    except Exception as e:
-                        if args.debug:
-                            print(f"  └─ {symbol} ({interval}): Attempt {attempt+1} failed with {time_unit} ({str(e)[:50]})")
-                        pass
-        
-        if args.debug:
-            print(f"  ✗ {symbol}: Unable to fetch {interval} data (all timestamp formats exhausted)")
-        return None
+                        return {
+                            'time': np.array(d['time'], dtype=np.int64),
+                            'open': np.array(d['open'], dtype=np.float64),
+                            'high': np.array(d['high'], dtype=np.float64),
+                            'low': np.array(d['low'], dtype=np.float64),
+                            'close': np.array(d['close'], dtype=np.float64),
+                            'volume': np.array(d['volume'], dtype=np.float64),
+                            'open_interest': np.array(d.get('openInterest', np.zeros_like(d['close'])), dtype=np.float64)
+                        }
+                except Exception as e:
+                    if args.debug:
+                        print(f"  └─ {symbol} ({interval}): Attempt {attempt+1} failed: {str(e)[:50]}")
+                    await asyncio.sleep(0.5)
+            return None
 
 async def main():
     pipeline = ProductionDataPipeline(args.api_url)
     async with aiohttp.ClientSession() as session:
         print("=" * 70)
-        print("🚀 MEXC 4H Breakout Scanner V3 | Adaptive Timestamp Engine")
+        print("🚀 MEXC 4H Breakout Scanner V3 | Production Engine")
         print("=" * 70)
         
         print("\n[INIT] Fetching active symbols from MEXC...")
@@ -248,7 +216,7 @@ async def main():
         if not universe:
             print("❌ Universe Empty. Verification failed.")
             return
-        
+
         print(f"[INIT] Successfully loaded {len(universe)} symbols. Analyzing market cycles...\n")
         
         print("[DATA] Fetching BTC benchmark data...")
