@@ -57,7 +57,7 @@ class VectorizedQuantEngine:
         return atr
 
     @classmethod
-    def evaluate_market_data(cls, h4_data: dict, daily_data: dict, btc_returns: np.ndarray, ignore_resistance: bool = False) -> Optional[dict]:
+    def evaluate_market_data(cls, symbol: str, h4_data: dict, daily_data: dict, btc_returns: np.ndarray, ignore_resistance: bool = False) -> Optional[dict]:
         c_h4, h_h4, l_h4, v_h4, o_h4 = h4_data['close'], h4_data['high'], h4_data['low'], h4_data['volume'], h4_data['open']
         oi_h4 = h4_data.get('open_interest', np.zeros_like(c_h4))
         c_d = daily_data['close']
@@ -67,10 +67,6 @@ class VectorizedQuantEngine:
         
         avg_dollar_vol_4d = float(np.mean(v_h4[-24:] * c_h4[-24:]))
         if avg_dollar_vol_4d < CONFIG_MATRIX["HARD_LIQUIDITY_FLOOR_USD"]: return None
-            
-        if not ignore_resistance:
-            recent_max_resistance = float(np.max(h_h4[-30:-1])) if len(h_h4) >= 30 else float(np.max(h_h4[:-1]))
-            if c_h4[idx] < recent_max_resistance * 0.95: return None
 
         atr = cls.calculate_wilder_atr(h_h4, l_h4, c_h4, period=14)
         candle_range = h_h4[idx] - l_h4[idx]
@@ -115,6 +111,12 @@ class VectorizedQuantEngine:
         
         composite_alpha_score = score_volume + score_momentum + score_coiling + score_trend + score_oi + score_funding + score_alpha
         
+        print(f"DEBUG {symbol}: score={composite_alpha_score:.1f}, vol_pct={vol_percentile*100:.1f}, atr_mult={atr_mult:.2f}")
+
+        if not ignore_resistance:
+            recent_max_resistance = float(np.max(h_h4[-30:-1])) if len(h_h4) >= 30 else float(np.max(h_h4[:-1]))
+            if c_h4[idx] < recent_max_resistance * 0.95: return None
+        
         if not ignore_resistance and composite_alpha_score < args.alpha_threshold: return None
         
         raw_time = int(h4_data['time'][idx])
@@ -145,7 +147,6 @@ class ProductionDataPipeline:
         except Exception: return []
 
     async def fetch_clean_kline(self, session: aiohttp.ClientSession, symbol: str, interval: str, duration_days: int) -> Optional[dict]:
-        # FIXED: Convert Unix timestamps to Milliseconds for MEXC Contract API
         end_time = int(time.time() * 1000)
         start_time = end_time - (duration_days * 86400 * 1000)
         url = f"{self.base_url}/api/v1/contract/kline/{symbol}"
@@ -186,6 +187,8 @@ async def main():
         if btc_data and len(btc_data['close']) > 1:
             btc_closes = btc_data['close'][-21:]
             btc_returns = np.diff(btc_closes) / btc_closes[:-1] if len(btc_closes) > 1 else np.zeros(20)
+        else:
+            print("WARNING: BTC data unavailable or corrupt. Alpha score component using flat baseline.")
 
         tasks = []
         for sym in universe:
@@ -193,7 +196,7 @@ async def main():
                 h4 = await pipeline.fetch_clean_kline(session, s, "Hour4", duration_days=20)
                 d1 = await pipeline.fetch_clean_kline(session, s, "Day1", duration_days=45)
                 if h4 and d1:
-                    res = VectorizedQuantEngine.evaluate_market_data(h4, d1, btc_returns, ignore_resistance=False)
+                    res = VectorizedQuantEngine.evaluate_market_data(s, h4, d1, btc_returns, ignore_resistance=False)
                     if res: res["symbol"] = s; return res
                 return None
             tasks.append(scan())
@@ -211,7 +214,7 @@ async def main():
                     h4 = await pipeline.fetch_clean_kline(session, s, "Hour4", duration_days=20)
                     d1 = await pipeline.fetch_clean_kline(session, s, "Day1", duration_days=45)
                     if h4 and d1:
-                        res = VectorizedQuantEngine.evaluate_market_data(h4, d1, btc_returns, ignore_resistance=True)
+                        res = VectorizedQuantEngine.evaluate_market_data(s, h4, d1, btc_returns, ignore_resistance=True)
                         if res: res["symbol"] = s; return res
                     return None
                 fallback_tasks.append(scan_fb())
