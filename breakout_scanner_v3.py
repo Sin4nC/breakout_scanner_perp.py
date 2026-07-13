@@ -1,4 +1,3 @@
-# breakout_scanner_v3.py
 import argparse
 import asyncio
 import time
@@ -27,6 +26,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--api-url", default="https://contract.mexc.com")
 parser.add_argument("--concurrency-limit", type=int, default=20)
 parser.add_argument("--alpha-threshold", type=float, default=30.0)
+parser.add_argument("--debug", action="store_true", help="Enable detailed debugging output")
 args = parser.parse_args()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -62,11 +62,18 @@ class VectorizedQuantEngine:
         oi_h4 = h4_data.get('open_interest', np.zeros_like(c_h4))
         c_d = daily_data['close']
         
-        if len(c_h4) < 30 or len(c_d) < 20: return None
+        if len(c_h4) < 30 or len(c_d) < 20: 
+            if args.debug:
+                print(f"  └─ {symbol}: REJECTED - Insufficient history (h4:{len(c_h4)}, d1:{len(c_d)})")
+            return None
+            
         idx = -1
-        
         avg_dollar_vol_4d = float(np.mean(v_h4[-24:] * c_h4[-24:]))
-        if avg_dollar_vol_4d < CONFIG_MATRIX["HARD_LIQUIDITY_FLOOR_USD"]: return None
+        
+        if avg_dollar_vol_4d < CONFIG_MATRIX["HARD_LIQUIDITY_FLOOR_USD"]:
+            if args.debug:
+                print(f"  └─ {symbol}: REJECTED - Low liquidity (${avg_dollar_vol_4d:.0f})")
+            return None
 
         atr = cls.calculate_wilder_atr(h_h4, l_h4, c_h4, period=14)
         candle_range = h_h4[idx] - l_h4[idx]
@@ -111,13 +118,24 @@ class VectorizedQuantEngine:
         
         composite_alpha_score = score_volume + score_momentum + score_coiling + score_trend + score_oi + score_funding + score_alpha
         
-        print(f"DEBUG {symbol}: score={composite_alpha_score:.1f}, vol_pct={vol_percentile*100:.1f}, atr_mult={atr_mult:.2f}")
+        # DEBUG: Full component breakdown
+        if args.debug:
+            print(f"\n  ✓ {symbol} ANALYSIS:")
+            print(f"    Score: {composite_alpha_score:.1f} | Vol%: {vol_percentile*100:.0f} | ATR: {atr_mult:.2f}x | OI: {oi_change_pct*100:+.1f}%")
+            print(f"    Breakdown: Vol={score_volume:.1f} | Mom={score_momentum:.1f} | Coil={score_coiling:.1f} | Trend={score_trend:.1f} | OI={score_oi:.1f} | Alpha={score_alpha:.1f}")
+            print(f"    Liquidity: ${avg_dollar_vol_4d:,.0f} | Beta: {beta:.2f}")
 
         if not ignore_resistance:
             recent_max_resistance = float(np.max(h_h4[-30:-1])) if len(h_h4) >= 30 else float(np.max(h_h4[:-1]))
-            if c_h4[idx] < recent_max_resistance * 0.95: return None
+            if c_h4[idx] < recent_max_resistance * 0.95:
+                if args.debug:
+                    print(f"  └─ {symbol}: REJECTED - Below 95% resistance ({c_h4[idx]:.2f} < {recent_max_resistance * 0.95:.2f})")
+                return None
         
-        if not ignore_resistance and composite_alpha_score < args.alpha_threshold: return None
+        if not ignore_resistance and composite_alpha_score < args.alpha_threshold:
+            if args.debug:
+                print(f"  └─ {symbol}: REJECTED - Below threshold ({composite_alpha_score:.1f} < {args.alpha_threshold})")
+            return None
         
         raw_time = int(h4_data['time'][idx])
         if raw_time > 1e11: raw_time = raw_time // 1000
@@ -135,6 +153,7 @@ class ProductionDataPipeline:
     def __init__(self, base_url: str):
         self.base_url = base_url
         self.semaphore = asyncio.Semaphore(args.concurrency_limit)
+        self.api_timestamp_mode = None  # Cache which format works
 
     async def retrieve_active_universe(self, session: aiohttp.ClientSession) -> List[str]:
         url = f"{self.base_url}/api/v1/contract/detail"
@@ -142,54 +161,107 @@ class ProductionDataPipeline:
             async with session.get(url, timeout=10) as response:
                 payload = await response.json()
                 data = payload.get("data") or []
-                return [str(item.get("symbol")).upper() for item in data 
+                symbols = [str(item.get("symbol")).upper() for item in data 
                         if str(item.get("settleCoin")).upper() == "USDT" and int(item.get("state", 0)) == 0]
-        except Exception: return []
+                if args.debug:
+                    print(f"[UNIVERSE] Loaded {len(symbols)} active USDT perpetual pairs")
+                return symbols
+        except Exception as e:
+            print(f"[ERROR] Failed to retrieve universe: {e}")
+            return []
 
     async def fetch_clean_kline(self, session: aiohttp.ClientSession, symbol: str, interval: str, duration_days: int) -> Optional[dict]:
-        end_time = int(time.time() * 1000)
-        start_time = end_time - (duration_days * 86400 * 1000)
+        """
+        🔧 ADAPTIVE TIMESTAMP ENGINE
+        
+        Attempts to fetch klines with intelligent fallback:
+        1. First tries the cached working format (if known)
+        2. Falls back to seconds, then milliseconds
+        3. Caches the successful format for future requests
+        """
         url = f"{self.base_url}/api/v1/contract/kline/{symbol}"
-        params = {"interval": interval, "start": start_time, "end": end_time}
-        async with self.semaphore:
-            for attempt in range(3):
-                try:
-                    async with session.get(url, params=params, timeout=12) as response:
-                        if response.status == 429:
-                            await asyncio.sleep(2 ** attempt)
-                            continue
-                        if response.status != 200: return None
-                        raw = await response.json()
-                        d = raw.get("data") or {}
-                        if not d or 'time' not in d or len(d['time']) == 0: return None
-                        return {
-                            'time': np.array(d['time'], dtype=np.int64),
-                            'open': np.array(d['open'], dtype=np.float64),
-                            'high': np.array(d['high'], dtype=np.float64),
-                            'low': np.array(d['low'], dtype=np.float64),
-                            'close': np.array(d['close'], dtype=np.float64),
-                            'volume': np.array(d['volume'], dtype=np.float64),
-                            'open_interest': np.array(d.get('openInterest', np.zeros_like(d['close'])), dtype=np.float64)
-                        }
-                except: await asyncio.sleep(0.5)
-            return None
+        now_sec = int(time.time())
+        
+        # Attempt order: cached format first, then seconds, then milliseconds
+        time_formats = []
+        if self.api_timestamp_mode:
+            time_formats.append(self.api_timestamp_mode)
+        time_formats.extend(['seconds', 'milliseconds'])
+        
+        for time_unit in time_formats:
+            if time_unit == 'seconds':
+                end_time = now_sec
+                start_time = now_sec - (duration_days * 86400)
+            else:  # milliseconds
+                end_time = now_sec * 1000
+                start_time = (now_sec - (duration_days * 86400)) * 1000
+
+            params = {"interval": interval, "start": start_time, "end": end_time}
+            
+            async with self.semaphore:
+                for attempt in range(3):
+                    try:
+                        async with session.get(url, params=params, timeout=12) as response:
+                            if response.status == 429:
+                                await asyncio.sleep(2 ** attempt)
+                                continue
+                            if response.status != 200:
+                                continue
+                            
+                            raw = await response.json()
+                            d = raw.get("data") or {}
+                            
+                            if d and 'time' in d and len(d['time']) > 0:
+                                # Cache successful format
+                                if not self.api_timestamp_mode:
+                                    self.api_timestamp_mode = time_unit
+                                    if args.debug:
+                                        print(f"[API] Detected working timestamp format: {time_unit}")
+                                
+                                return {
+                                    'time': np.array(d['time'], dtype=np.int64),
+                                    'open': np.array(d['open'], dtype=np.float64),
+                                    'high': np.array(d['high'], dtype=np.float64),
+                                    'low': np.array(d['low'], dtype=np.float64),
+                                    'close': np.array(d['close'], dtype=np.float64),
+                                    'volume': np.array(d['volume'], dtype=np.float64),
+                                    'open_interest': np.array(d.get('openInterest', np.zeros_like(d['close'])), dtype=np.float64)
+                                }
+                    except Exception as e:
+                        if args.debug:
+                            print(f"  └─ {symbol} ({interval}): Attempt {attempt+1} failed with {time_unit} ({str(e)[:50]})")
+                        pass
+        
+        if args.debug:
+            print(f"  ✗ {symbol}: Unable to fetch {interval} data (all timestamp formats exhausted)")
+        return None
 
 async def main():
     pipeline = ProductionDataPipeline(args.api_url)
     async with aiohttp.ClientSession() as session:
-        print("Fetching active symbols from MEXC...")
-        universe = await pipeline.retrieve_active_universe(session)
-        if not universe: print("Universe Empty. Verification failed."); return
-        print(f"Successfully loaded {len(universe)} symbols. Analyzing market cycles...")
+        print("=" * 70)
+        print("🚀 MEXC 4H Breakout Scanner V3 | Adaptive Timestamp Engine")
+        print("=" * 70)
         
+        print("\n[INIT] Fetching active symbols from MEXC...")
+        universe = await pipeline.retrieve_active_universe(session)
+        if not universe:
+            print("❌ Universe Empty. Verification failed.")
+            return
+        
+        print(f"[INIT] Successfully loaded {len(universe)} symbols. Analyzing market cycles...\n")
+        
+        print("[DATA] Fetching BTC benchmark data...")
         btc_data = await pipeline.fetch_clean_kline(session, "BTC_USDT", "Hour4", duration_days=20)
         btc_returns = np.zeros(20)
         if btc_data and len(btc_data['close']) > 1:
             btc_closes = btc_data['close'][-21:]
             btc_returns = np.diff(btc_closes) / btc_closes[:-1] if len(btc_closes) > 1 else np.zeros(20)
+            print(f"  ✓ BTC ready ({len(btc_data['close'])} candles, μ_return={np.mean(btc_returns)*100:+.3f}%)")
         else:
-            print("WARNING: BTC data unavailable or corrupt. Alpha score component using flat baseline.")
+            print("  ⚠️  BTC data unavailable or corrupt. Alpha score using flat baseline.")
 
+        print(f"\n[SCAN] Analyzing {len(universe)} assets...")
         tasks = []
         for sym in universe:
             async def scan(s=sym):
@@ -206,7 +278,7 @@ async def main():
         
         is_fallback = False
         if not validated_signals:
-            print("No signals found in Alpha Mode. Engaging Fallback Scanner...")
+            print(f"  └─ No signals in Alpha Mode. Engaging Fallback Scanner (no resistance filter)...\n")
             is_fallback = True
             fallback_tasks = []
             for sym in universe:
@@ -224,18 +296,24 @@ async def main():
         validated_signals.sort(key=lambda x: x['score'], reverse=True)
         
         if validated_signals:
-            mode_title = "Fallback Mode (No Res Filter)" if is_fallback else "Ultra Strategy Mode"
+            mode_title = "Fallback Mode (No Resistance Filter)" if is_fallback else "Alpha Mode"
             msg_lines = [f"📊 *MEXC 4H Breakout Scanner V3 ({mode_title})* 🚀\n"]
+            msg_lines.append(f"⏰ Scan Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n")
+            
             for rank, sig in enumerate(validated_signals[:15], 1):
-                line = f"{rank}. *{sig['symbol']}* | Score: {sig['score']} | Price: {sig['close']} (RVOL: {sig['rvol_pct']}% | ATR: {sig['atr_mult']})\n"
+                line = f"{rank}. *{sig['symbol']}* | Score: {sig['score']} | Price: {sig['close']:.4f}\n   └─ RVOL: {sig['rvol_pct']}% | ATR: {sig['atr_mult']}x | OI: {sig['oi_growth']:+.1f}%\n"
                 msg_lines.append(line)
             
             full_message = "\n".join(msg_lines)
-            print("\n=== SCAN COMPLETED SUCCESSFULLY ===")
+            print("\n" + "=" * 70)
+            print("✅ SCAN COMPLETED SUCCESSFULLY")
+            print("=" * 70)
             print(full_message)
             send_telegram_message(full_message)
         else:
-            print("Scan completed. No assets matched the baseline strategy filters.")
+            print("\n" + "=" * 70)
+            print("ℹ️  Scan completed. No assets matched the baseline strategy filters.")
+            print("=" * 70)
 
 if __name__ == "__main__":
     asyncio.run(main())
