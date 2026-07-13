@@ -34,14 +34,16 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 def send_telegram_message(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram credentials not found.")
+        print("Telegram credentials not found. Skipping Telegram transmission.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
-        requests.post(url, json=payload, timeout=10)
+        res = requests.post(url, json=payload, timeout=10)
+        if res.status_code != 200:
+            print(f"Telegram API Error: {res.text}")
     except Exception as e:
-        print(f"Telegram Error: {e}")
+        print(f"Telegram Connection Error: {e}")
 
 class VectorizedQuantEngine:
     @staticmethod
@@ -115,13 +117,16 @@ class VectorizedQuantEngine:
         
         if not ignore_resistance and composite_alpha_score < args.alpha_threshold: return None
         
+        raw_time = int(h4_data['time'][idx])
+        if raw_time > 1e11: raw_time = raw_time // 1000
+        
         return {
             "score": round(composite_alpha_score, 1),
             "close": float(c_h4[idx]),
             "rvol_pct": round(vol_percentile * 100, 1),
             "atr_mult": round(atr_mult, 2),
             "oi_growth": round(oi_change_pct * 100, 1),
-            "timestamp": datetime.fromtimestamp(int(h4_data['time'][idx]), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            "timestamp": datetime.fromtimestamp(raw_time, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         }
 
 class ProductionDataPipeline:
@@ -140,8 +145,9 @@ class ProductionDataPipeline:
         except Exception: return []
 
     async def fetch_clean_kline(self, session: aiohttp.ClientSession, symbol: str, interval: str, duration_days: int) -> Optional[dict]:
-        end_time = int(time.time())
-        start_time = end_time - (duration_days * 86400)
+        # FIXED: Convert Unix timestamps to Milliseconds for MEXC Contract API
+        end_time = int(time.time() * 1000)
+        start_time = end_time - (duration_days * 86400 * 1000)
         url = f"{self.base_url}/api/v1/contract/kline/{symbol}"
         params = {"interval": interval, "start": start_time, "end": end_time}
         async with self.semaphore:
@@ -170,8 +176,10 @@ class ProductionDataPipeline:
 async def main():
     pipeline = ProductionDataPipeline(args.api_url)
     async with aiohttp.ClientSession() as session:
+        print("Fetching active symbols from MEXC...")
         universe = await pipeline.retrieve_active_universe(session)
-        if not universe: print("Universe Empty"); return
+        if not universe: print("Universe Empty. Verification failed."); return
+        print(f"Successfully loaded {len(universe)} symbols. Analyzing market cycles...")
         
         btc_data = await pipeline.fetch_clean_kline(session, "BTC_USDT", "Hour4", duration_days=20)
         btc_returns = np.zeros(20)
@@ -195,6 +203,7 @@ async def main():
         
         is_fallback = False
         if not validated_signals:
+            print("No signals found in Alpha Mode. Engaging Fallback Scanner...")
             is_fallback = True
             fallback_tasks = []
             for sym in universe:
@@ -219,10 +228,11 @@ async def main():
                 msg_lines.append(line)
             
             full_message = "\n".join(msg_lines)
+            print("\n=== SCAN COMPLETED SUCCESSFULLY ===")
             print(full_message)
             send_telegram_message(full_message)
         else:
-            print("No signals found in any mode. Check API Connection.")
+            print("Scan completed. No assets matched the baseline strategy filters.")
 
 if __name__ == "__main__":
     asyncio.run(main())
