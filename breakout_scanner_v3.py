@@ -20,13 +20,13 @@ CONFIG_MATRIX = {
     "WEIGHT_OI": 10.0,
     "WEIGHT_ALPHA": 10.0,
     "WEIGHT_FUNDING": 5.0,
-    "HARD_LIQUIDITY_FLOOR_USD": 50_000.0  # Dynamic floor for lower volume assets like KITE
+    "HARD_LIQUIDITY_FLOOR_USD": 50_000.0
 }
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--api-url", default="https://contract.mexc.com")
 parser.add_argument("--concurrency-limit", type=int, default=20)
-parser.add_argument("--alpha-threshold", type=float, default=30.0) # Lowered threshold for dynamic testing
+parser.add_argument("--alpha-threshold", type=float, default=30.0)
 args = parser.parse_args()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -38,8 +38,10 @@ def send_telegram_message(message: str):
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    try: requests.post(url, json=payload, timeout=10)
-    except Exception as e: print(f"Telegram Error: {e}")
+    try: 
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e: 
+        print(f"Telegram Error: {e}")
 
 class VectorizedQuantEngine:
     @staticmethod
@@ -64,7 +66,6 @@ class VectorizedQuantEngine:
         avg_dollar_vol_4d = float(np.mean(v_h4[-24:] * c_h4[-24:]))
         if avg_dollar_vol_4d < CONFIG_MATRIX["HARD_LIQUIDITY_FLOOR_USD"]: return None
             
-        # Resistance filter logic
         if not ignore_resistance:
             recent_max_resistance = float(np.max(h_h4[-30:-1])) if len(h_h4) >= 30 else float(np.max(h_h4[:-1]))
             if c_h4[idx] < recent_max_resistance * 0.95: return None
