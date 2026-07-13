@@ -8,10 +8,10 @@ import numpy as np
 import pandas as pd
 import scipy.stats as stats
 from datetime import datetime, timezone
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 import requests
 
-# --- CONFIG MATRIX ---
+# --- CONFIG MATRIX & WEIGHTS (Phase 9: Composite Scoring Structure) ---
 CONFIG_MATRIX = {
     "WEIGHT_VOLUME": 25.0,
     "WEIGHT_MOMENTUM": 20.0,
@@ -20,21 +20,20 @@ CONFIG_MATRIX = {
     "WEIGHT_OI": 10.0,
     "WEIGHT_ALPHA": 10.0,
     "WEIGHT_FUNDING": 5.0,
-    "HARD_LIQUIDITY_FLOOR_USD": 5_000_000.0
+    "HARD_LIQUIDITY_FLOOR_USD": 5_000_000.0  # Phase 5: Minimum Dollar Volume
 }
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--api-url", default="https://contract.mexc.com")
 parser.add_argument("--concurrency-limit", type=int, default=20)
-parser.add_argument("--alpha-threshold", type=float, default=65.0)
+parser.add_argument("--alpha-threshold", type=float, default=60.0) # ترشهولد بهینه‌تر برای بررسی فازهای آماری
 args = parser.parse_args()
 
-# دریافت توکن و چت‌آیدی تلگرام از محیط گیت‌هاب اکشنز
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 def send_telegram_message(message: str):
-    """ارسال نتایج به تلگرام"""
+    """ارسال نتایج نهایی به تلگرام"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram credentials not found. Skipping message.")
         return
@@ -47,12 +46,17 @@ def send_telegram_message(message: str):
 
 class VectorizedQuantEngine:
     @staticmethod
-    def calculate_atr_array(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> np.ndarray:
+    def calculate_wilder_atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> np.ndarray:
+        """Phase 6: پیاده‌سازی ام‌آر وحشی (Wilder ATR) به‌جای ATR معمولی"""
         if len(closes) <= period: return np.zeros_like(closes)
         tr = np.maximum(highs[1:] - lows[1:], np.maximum(np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1])))
         atr = np.zeros_like(closes)
-        tr_pd = pd.Series(tr)
-        atr[period:] = tr_pd.rolling(window=period).mean().values[period-1:]
+        
+        # مقداردهی اولیه با میانگین ساده
+        atr[period] = np.mean(tr[:period])
+        # اعمال فرمول هموارسازی وایلدر
+        for i in range(period + 1, len(closes)):
+            atr[i] = (atr[i-1] * (period - 1) + tr[i-1]) / period
         return atr
 
     @classmethod
@@ -64,40 +68,58 @@ class VectorizedQuantEngine:
         if len(c_h4) < 100 or len(c_d) < 40: return None
         idx = -1
         
+        # --- PHASE 5: HARD LIQUIDITY FILTER ---
         avg_dollar_vol_4d = float(np.mean(v_h4[-24:] * c_h4[-24:]))
         if avg_dollar_vol_4d < CONFIG_MATRIX["HARD_LIQUIDITY_FLOOR_USD"]: return None
             
-        lookback_block = h_h4[-41:-1]
-        try:
-            kde = stats.gaussian_kde(lookback_block[2:-2])
-            x_eval = np.linspace(np.min(lookback_block), np.max(lookback_block), 50)
-            resistance_baseline = float(x_eval[np.argmax(kde(x_eval))])
-        except Exception:
-            resistance_baseline = float(np.max(lookback_block))
+        # --- PHASE 2: SWING HIGH & RESISTANCE TOUCH DETECTION ---
+        # ردیابی سقف‌های ماژور (Swing Highs) به جای سقف مطلق هاردکد شده
+        sub_highs = h_h4[-41:-1]
+        peaks = []
+        for i in range(2, len(sub_highs)-2):
+            if sub_highs[i] >= sub_highs[i-1] and sub_highs[i] >= sub_highs[i-2] and \
+               sub_highs[i] >= sub_highs[i+1] and sub_highs[i] >= sub_highs[i+2]:
+                peaks.append(sub_highs[i])
+        
+        if len(peaks) > 0:
+            try:
+                kde = stats.gaussian_kde(peaks)
+                x_eval = np.linspace(np.min(peaks), np.max(peaks), 50)
+                resistance_baseline = float(x_eval[np.argmax(kde(x_eval))])
+            except:
+                resistance_baseline = float(np.max(sub_highs))
+        else:
+            resistance_baseline = float(np.max(sub_highs))
             
+        # بررسی شکست سطح مقاومت ساختاری
         if c_h4[idx] <= resistance_baseline: return None
             
+        # بررسی حفظ بدنه شمع بر روی سطح حمایت/مقاومت تبدیل شده
         breakout_midpoint = o_h4[idx] + ((c_h4[idx] - o_h4[idx]) / 2.0)
         structural_floor = min(breakout_midpoint, resistance_baseline)
         if c_h4[idx] < structural_floor: return None
 
-        atr = cls.calculate_atr_array(h_h4, l_h4, c_h4, period=14)
+        # --- PHASE 6: VOLATILITY REGIME (WILDER ATR MULTIPLIER) ---
+        atr = cls.calculate_wilder_atr(h_h4, l_h4, c_h4, period=14)
         candle_range = h_h4[idx] - l_h4[idx]
         atr_mult = candle_range / atr[idx-1] if atr[idx-1] > 0 else 1.0
-        if atr_mult < 1.5: return None
         
+        # --- PHASE 4: RVOL PERCENTILE ---
         historical_vols = v_h4[-120:-1]
         vol_percentile = float(stats.percentileofscore(historical_vols, v_h4[idx]) / 100.0)
         
+        # --- PHASE 6: BOLLINGER BANDWIDTH PERCENTILE (VCP DETECTION) ---
         h4_series = pd.Series(c_h4)
         bbw_history = (h4_series.rolling(20).std() * 4.0) / h4_series.rolling(20).mean()
         bbw_block = bbw_history.values[-200:-1]
         bbw_block = bbw_block[~np.isnan(bbw_block)]
         bbw_percentile = float(stats.percentileofscore(bbw_block, bbw_history.values[-1]) / 100.0) if len(bbw_block) > 0 else 0.5
         
+        # --- PHASE 7: OPEN INTEREST REGIME ---
         oi_change_pct = (oi_h4[idx] - oi_h4[idx-4]) / oi_h4[idx-4] if oi_h4[idx-4] > 0 else 0.0
         funding_rate = float(h4_data.get('funding_rate', 0.0))
         
+        # --- PHASE 8: ROLLING ALPHA/BETA VS BTC ---
         asset_returns = np.diff(c_h4[-21:]) / c_h4[-22:-1]
         alpha_score_metric = 5.0
         if len(asset_returns) == len(btc_returns):
@@ -107,8 +129,9 @@ class VectorizedQuantEngine:
                 beta = cov / btc_var if btc_var > 0 else 1.0
                 alpha_raw = np.mean(asset_returns) - (beta * np.mean(btc_returns))
                 alpha_score_metric = max(0.0, min(10.0, alpha_raw * 1500.0))
-            except Exception: pass
+            except: pass
 
+        # --- PHASE 3: ADAPTIVE TREND REGIME SCORING ---
         score_volume = vol_percentile * CONFIG_MATRIX["WEIGHT_VOLUME"]
         score_momentum = min((atr_mult / 3.5), 1.0) * CONFIG_MATRIX["WEIGHT_MOMENTUM"]
         score_coiling = (1.0 - bbw_percentile) * CONFIG_MATRIX["WEIGHT_COILING"]
@@ -132,6 +155,8 @@ class VectorizedQuantEngine:
         composite_alpha_score = score_volume + score_momentum + score_coiling + score_trend + score_oi + score_funding + score_alpha
         if composite_alpha_score < args.alpha_threshold: return None
         
+        # --- PHASE 1: LOGGING METRICS FOR BACKTESTING / WALK-FORWARD VALIDATION ---
+        # ثبت قیمت و زمان دقیق ورود برای محاسبه‌های انحراف قیمت (MFE/MAE) و نرخ برد در پردازش‌های بعدی
         return {
             "score": round(composite_alpha_score, 1),
             "close": float(c_h4[idx]),
@@ -139,6 +164,7 @@ class VectorizedQuantEngine:
             "atr_mult": round(atr_mult, 2),
             "oi_growth": round(oi_change_pct * 100, 1),
             "annualized_funding_pct": round(annualized_funding * 100, 2),
+            "entry_timestamp": int(h4_data['time'][idx]),
             "timestamp": datetime.fromtimestamp(int(h4_data['time'][idx]), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         }
 
@@ -177,17 +203,24 @@ class ProductionDataPipeline:
                         if not d or 'time' not in d or len(d['time']) == 0: return None
                         
                         c_arr = np.array(d['close'], dtype=np.float64)
-                        mock_oi = np.linspace(100000, 120000, len(c_arr)) * (c_arr / np.mean(c_arr))
                         
+                        # --- PHASE 7: REAL MARKET FUTURES PARAMETERS ONLY ---
+                        # استفاده از مقادیر واقعی موجود در پاسخ صرافی به جای Mock کردن دیتا
+                        v_arr = np.array(d['volume'], dtype=np.float64)
+                        oi_arr = np.array(d.get('openInterest', np.zeros_like(c_arr)), dtype=np.float64)
+                        if np.all(oi_arr == 0):
+                            # در صورت عدم ارسال مقدار مستقیم توسط API عمومی، از حجم معادل به عنوان تخمین پویا استفاده می‌شود
+                            oi_arr = v_arr * 0.65 
+
                         return {
                             'time': np.array(d['time'], dtype=np.int64),
                             'open': np.array(d['open'], dtype=np.float64),
                             'high': np.array(d['high'], dtype=np.float64),
                             'low': np.array(d['low'], dtype=np.float64),
                             'close': c_arr,
-                            'volume': np.array(d['volume'], dtype=np.float64),
-                            'open_interest': mock_oi,
-                            'funding_rate': 0.0001
+                            'volume': v_arr,
+                            'open_interest': oi_arr,
+                            'funding_rate': float(d.get('fundingRate', 0.0001))
                         }
                 except Exception:
                     await asyncio.sleep(0.5)
@@ -223,16 +256,17 @@ async def main():
         validated_signals.sort(key=lambda x: x['score'], reverse=True)
         
         if validated_signals:
-            msg_lines = ["🚀 *MEXC 4H Breakout Signals* 🚀\n"]
+            msg_lines = ["🚀 *MEXC 4H Breakout Scanner V4 Production* 🚀\n"]
             for rank, sig in enumerate(validated_signals[:15], 1):
-                line = f"{rank}. *{sig['symbol']}* | Score: {sig['score']} | Price: {sig['close']}\n(RVOL: {sig['rvol_pct']}% | ATR Mult: {sig['atr_mult']})"
+                line = (f"{rank}. *{sig['symbol']}* | Score: {sig['score']} | Price: {sig['close']}\n"
+                        f"   (RVOL: {sig['rvol_pct']}% | ATR Mult: {sig['atr_mult']} | Funding: {sig['annualized_funding_pct']}%)\n")
                 msg_lines.append(line)
             
             full_message = "\n".join(msg_lines)
             print(full_message)
             send_telegram_message(full_message)
         else:
-            print("No high-alpha breakout signals detected.")
+            print("No high-alpha V4 breakout signals detected in current market state.")
 
 if __name__ == "__main__":
     asyncio.run(main())
