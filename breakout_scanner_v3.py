@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import scipy.stats as stats
 from datetime import datetime, timezone
+from typing import Optional, List, Tuple
 import requests
 
 # --- CONFIG MATRIX ---
