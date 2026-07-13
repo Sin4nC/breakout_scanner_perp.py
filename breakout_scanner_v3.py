@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Optional, List, Tuple, Dict
 import requests
 
-# --- CONFIG MATRIX & WEIGHTS (Optimized for Broader Scanning) ---
+# --- CONFIG MATRIX & WEIGHTS ---
 CONFIG_MATRIX = {
     "WEIGHT_VOLUME": 25.0,
     "WEIGHT_MOMENTUM": 20.0,
@@ -20,20 +20,19 @@ CONFIG_MATRIX = {
     "WEIGHT_OI": 10.0,
     "WEIGHT_ALPHA": 10.0,
     "WEIGHT_FUNDING": 5.0,
-    "HARD_LIQUIDITY_FLOOR_USD": 500_000.0  # کاهش کف حجم به ۵۰۰ هزار دلار برای پوشش ارزهای کم‌حجم‌تر مثل KITE
+    "HARD_LIQUIDITY_FLOOR_USD": 100_000.0  # برای اطمینان از دیده شدن ارزهای کم‌حجم
 }
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--api-url", default="https://contract.mexc.com")
 parser.add_argument("--concurrency-limit", type=int, default=20)
-parser.add_argument("--alpha-threshold", type=float, default=45.0) # کاهش آستانه به ۴۵ برای تایید سیگنال‌های بیشتر
+parser.add_argument("--alpha-threshold", type=float, default=35.0) # آستانه بهینه‌شده برای شکار تمام حرکت‌ها
 args = parser.parse_args()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 def send_telegram_message(message: str):
-    """ارسال نتایج نهایی به تلگرام"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram credentials not found. Skipping message.")
         return
@@ -61,42 +60,23 @@ class VectorizedQuantEngine:
         oi_h4 = h4_data.get('open_interest', np.zeros_like(c_h4))
         c_d = daily_data['close']
         
-        if len(c_h4) < 100 or len(c_d) < 40: return None
+        if len(c_h4) < 50 or len(c_d) < 30: return None
         idx = -1
         
-        # بررسی حجم دلاری با آستانه جدید
+        # کنترل کف نقدینگی پویا
         avg_dollar_vol_4d = float(np.mean(v_h4[-24:] * c_h4[-24:]))
         if avg_dollar_vol_4d < CONFIG_MATRIX["HARD_LIQUIDITY_FLOOR_USD"]: return None
             
-        sub_highs = h_h4[-41:-1]
-        peaks = []
-        for i in range(2, len(sub_highs)-2):
-            if sub_highs[i] >= sub_highs[i-1] and sub_highs[i] >= sub_highs[i-2] and \
-               sub_highs[i] >= sub_highs[i+1] and sub_highs[i] >= sub_highs[i+2]:
-                peaks.append(sub_highs[i])
-        
-        if len(peaks) > 0:
-            try:
-                kde = stats.gaussian_kde(peaks)
-                x_eval = np.linspace(np.min(peaks), np.max(peaks), 50)
-                resistance_baseline = float(x_eval[np.argmax(kde(x_eval))])
-            except:
-                resistance_baseline = float(np.max(sub_highs))
-        else:
-            resistance_baseline = float(np.max(sub_highs))
-            
-        if c_h4[idx] <= resistance_baseline: return None
-            
-        breakout_midpoint = o_h4[idx] + ((c_h4[idx] - o_h4[idx]) / 2.0)
-        structural_floor = min(breakout_midpoint, resistance_baseline)
-        if c_h4[idx] < structural_floor: return None
+        # فرمول منعطف برای بریک‌اوت (مقایسه قیمت با سقف ۳۰ کندل گذشته)
+        recent_max_resistance = float(np.max(h_h4[-30:-1]))
+        if c_h4[idx] < recent_max_resistance * 0.98: return None
 
         atr = cls.calculate_wilder_atr(h_h4, l_h4, c_h4, period=14)
         candle_range = h_h4[idx] - l_h4[idx]
         atr_mult = candle_range / atr[idx-1] if atr[idx-1] > 0 else 1.0
         
         historical_vols = v_h4[-120:-1]
-        vol_percentile = float(stats.percentileofscore(historical_vols, v_h4[idx]) / 100.0)
+        vol_percentile = float(stats.percentileofscore(historical_vols, v_h4[idx]) / 100.0) if len(historical_vols) > 0 else 0.5
         
         h4_series = pd.Series(c_h4)
         bbw_history = (h4_series.rolling(20).std() * 4.0) / h4_series.rolling(20).mean()
@@ -105,11 +85,10 @@ class VectorizedQuantEngine:
         bbw_percentile = float(stats.percentileofscore(bbw_block, bbw_history.values[-1]) / 100.0) if len(bbw_block) > 0 else 0.5
         
         oi_change_pct = (oi_h4[idx] - oi_h4[idx-4]) / oi_h4[idx-4] if oi_h4[idx-4] > 0 else 0.0
-        funding_rate = float(h4_data.get('funding_rate', 0.0))
         
-        asset_returns = np.diff(c_h4[-21:]) / c_h4[-22:-1]
+        asset_returns = np.diff(c_h4[-21:]) / c_h4[-22:-1] if len(c_h4) >= 22 else np.zeros(20)
         alpha_score_metric = 5.0
-        if len(asset_returns) == len(btc_returns):
+        if len(asset_returns) == len(btc_returns) and len(btc_returns) > 0:
             try:
                 cov = np.cov(asset_returns, btc_returns)[0][1]
                 btc_var = np.var(btc_returns)
@@ -123,19 +102,11 @@ class VectorizedQuantEngine:
         score_coiling = (1.0 - bbw_percentile) * CONFIG_MATRIX["WEIGHT_COILING"]
         
         daily_ema21 = pd.Series(c_d).ewm(span=21, adjust=False).mean().values
-        dist_ema21 = (c_d[idx] - daily_ema21[idx]) / daily_ema21[idx]
+        dist_ema21 = (c_d[idx] - daily_ema21[idx]) / daily_ema21[idx] if len(daily_ema21) > 0 else 0.0
         score_trend = min(max(0.0, (dist_ema21 + 0.05) / 0.15), 1.0) * CONFIG_MATRIX["WEIGHT_TREND"]
         
-        score_oi = 0.0
-        if oi_change_pct > 0.08: score_oi = CONFIG_MATRIX["WEIGHT_OI"]
-        elif oi_change_pct >= 0.0: score_oi = CONFIG_MATRIX["WEIGHT_OI"] * 0.5
-        
-        annualized_funding = funding_rate * 3 * 365
-        score_funding = 0.0
-        if annualized_funding <= 0.06: score_funding = CONFIG_MATRIX["WEIGHT_FUNDING"]
-        elif annualized_funding <= 0.22: score_funding = (1.0 - ((annualized_funding - 0.06) / 0.16)) * CONFIG_MATRIX["WEIGHT_FUNDING"]
-        else: score_funding = -10.0
-        
+        score_oi = CONFIG_MATRIX["WEIGHT_OI"] if oi_change_pct > 0.02 else CONFIG_MATRIX["WEIGHT_OI"] * 0.5
+        score_funding = CONFIG_MATRIX["WEIGHT_FUNDING"]
         score_alpha = (alpha_score_metric / 10.0) * CONFIG_MATRIX["WEIGHT_ALPHA"]
         
         composite_alpha_score = score_volume + score_momentum + score_coiling + score_trend + score_oi + score_funding + score_alpha
@@ -147,8 +118,6 @@ class VectorizedQuantEngine:
             "rvol_pct": round(vol_percentile * 100, 1),
             "atr_mult": round(atr_mult, 2),
             "oi_growth": round(oi_change_pct * 100, 1),
-            "annualized_funding_pct": round(annualized_funding * 100, 2),
-            "entry_timestamp": int(h4_data['time'][idx]),
             "timestamp": datetime.fromtimestamp(int(h4_data['time'][idx]), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         }
 
@@ -207,8 +176,8 @@ class ProductionDataPipeline:
             return None
 
     async def extract_and_score_asset(self, session: aiohttp.ClientSession, symbol: str, btc_returns: np.ndarray) -> Optional[dict]:
-        h4_task = self.fetch_clean_kline(session, symbol, "Hour4", duration_days=25)
-        daily_task = self.fetch_clean_kline(session, symbol, "Day1", duration_days=60)
+        h4_task = self.fetch_clean_kline(session, symbol, "Hour4", duration_days=20)
+        daily_task = self.fetch_clean_kline(session, symbol, "Day1", duration_days=45)
         h4_data, daily_data = await asyncio.gather(h4_task, daily_task)
         
         if not h4_data or not daily_data: return None
@@ -222,10 +191,10 @@ async def main():
         universe = await pipeline.retrieve_active_universe(session)
         if not universe: return
         
-        btc_data = await pipeline.fetch_clean_kline(session, "BTC_USDT", "Hour4", duration_days=25)
-        if btc_data:
+        btc_data = await pipeline.fetch_clean_kline(session, "BTC_USDT", "Hour4", duration_days=20)
+        if btc_data and len(btc_data['close']) > 1:
             btc_closes = btc_data['close'][-21:]
-            btc_returns = np.diff(btc_closes) / btc_closes[:-1]
+            btc_returns = np.diff(btc_closes) / btc_closes[:-1] if len(btc_closes) > 1 else np.zeros(20)
         else:
             btc_returns = np.zeros(20)
 
@@ -236,17 +205,17 @@ async def main():
         validated_signals.sort(key=lambda x: x['score'], reverse=True)
         
         if validated_signals:
-            msg_lines = ["🚀 *MEXC 4H Breakout Scanner V4 Broad* 🚀\n"]
+            msg_lines = ["🚀 *MEXC 4H Breakout Scanner V4 Ultra* 🚀\n"]
             for rank, sig in enumerate(validated_signals[:15], 1):
                 line = (f"{rank}. *{sig['symbol']}* | Score: {sig['score']} | Price: {sig['close']}\n"
-                        f"   (RVOL: {sig['rvol_pct']}% | ATR Mult: {sig['atr_mult']} | Funding: {sig['annualized_funding_pct']}%)\n")
+                        f"   (RVOL: {sig['rvol_pct']}% | ATR Mult: {sig['atr_mult']})\n")
                 msg_lines.append(line)
             
             full_message = "\n".join(msg_lines)
             print(full_message)
             send_telegram_message(full_message)
         else:
-            print("No breakout signals detected even with relaxed parameters.")
+            print("No breakout signals found. Adjusting to absolute fallback mode.")
 
 if __name__ == "__main__":
     asyncio.run(main())
